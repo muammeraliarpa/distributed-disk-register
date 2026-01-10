@@ -41,7 +41,7 @@ type Node struct {
 	messageLocation map[string][]string
 }
 
-// --- KONFİGÜRASYON ---
+// ---   KONFİGÜRASYON   ---
 
 func readTolerance() int {
 	data, err := os.ReadFile("tolerance.conf")
@@ -51,7 +51,6 @@ func readTolerance() int {
 	t, _ := strconv.Atoi(strings.TrimSpace(string(data)))
 	return t
 }
-
 
 func (n *Node) RegisterMember(ctx context.Context, req *pb.RegistrationRequest) (*pb.RegistrationResponse, error) {
 	addr := req.GetAddress()
@@ -101,15 +100,10 @@ func (n *Node) syncAllMembers() {
 func (n *Node) SyncMembership(ctx context.Context, req *pb.MembershipList) (*pb.Empty, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-
-	for addr := range n.familyMembers {
-		delete(n.familyMembers, addr)
-	}
+	for addr := range n.familyMembers { delete(n.familyMembers, addr) }
 
 	for _, info := range req.Members {
-		if info.Address == n.address {
-			continue
-		}
+		if info.Address == n.address { continue }
 		conn, err := grpc.Dial(info.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err == nil {
 			n.familyMembers[info.Address] = &NodeMember{
@@ -126,14 +120,10 @@ func (n *Node) SyncMembership(ctx context.Context, req *pb.MembershipList) (*pb.
 func (n *Node) handleLeaderSet(messageID, content string) string {
 	n.mu.Lock()
 	var members []*NodeMember
-	for _, m := range n.familyMembers {
-		members = append(members, m)
-	}
+	for _, m := range n.familyMembers { members = append(members, m) }
 	n.mu.Unlock()
 
-	if len(members) < n.tolerance {
-		return "ERROR: Yetersiz üye"
-	}
+	if len(members) < n.tolerance { return "ERROR: Yetersiz üye" }
 
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].CurrentMessageCount < members[j].CurrentMessageCount
@@ -146,40 +136,23 @@ func (n *Node) handleLeaderSet(messageID, content string) string {
 	for _, m := range targetMembers {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
 		resp, err := m.Client.ReplicateMessage(ctx, &pb.ReplicateRequest{
-			MessageId:      messageID,
-			MessageContent: content,
+			MessageId: messageID, MessageContent: content,
 		})
 		cancel()
-
 		if err == nil && resp.Success {
 			actualSuccessCount++
 			successfullyWrittenMembers = append(successfullyWrittenMembers, m)
 		}
 	}
 
-	if actualSuccessCount < n.tolerance {
-		return "ERROR: Yazma başarısız, tolerans sağlanamadı"
-	}
+	if actualSuccessCount < n.tolerance { return "ERROR: Yazma başarısız, tolerans sağlanamadı" }
 
 	n.mu.Lock()
 	for _, m := range successfullyWrittenMembers {
-		alreadyHasIt := false
-		if owners, ok := n.messageLocation[messageID]; ok {
-			for _, addr := range owners {
-				if addr == m.Address {
-					alreadyHasIt = true
-					break
-				}
-			}
-		}
-
-		if !alreadyHasIt {
-			m.CurrentMessageCount++
-			n.messageLocation[messageID] = append(n.messageLocation[messageID], m.Address)
-		}
+		n.messageLocation[messageID] = append(n.messageLocation[messageID], m.Address)
+		m.CurrentMessageCount++
 	}
 	n.mu.Unlock()
-
 	n.syncAllMembers()
 	return "OK"
 }
@@ -190,7 +163,7 @@ func (n *Node) ReplicateMessage(ctx context.Context, req *pb.ReplicateRequest) (
 
 	id := req.GetMessageId()
 	content := req.GetMessageContent()
-
+	
 	filePath := fmt.Sprintf("%s/%s.txt", n.diskPath, id)
 	file, _ := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	writer := bufio.NewWriter(file)
@@ -199,10 +172,57 @@ func (n *Node) ReplicateMessage(ctx context.Context, req *pb.ReplicateRequest) (
 	file.Close()
 
 	n.storage[id] = content
-
 	return &pb.ReplicateResponse{Success: true}, nil
 }
 
+
+func (n *Node) handleLeaderGet(id string) (string, error) {
+	n.mu.Lock()
+	locations := n.messageLocation[id]
+	n.mu.Unlock()
+
+	if len(locations) == 0 {
+		return "", fmt.Errorf("mesaj sistemde bulunamadi")
+	}
+
+	for _, addr := range locations {
+		n.mu.Lock()
+		m, exists := n.familyMembers[addr]
+		n.mu.Unlock()
+		
+		if !exists { continue }
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		resp, err := m.Client.GetMessage(ctx, &pb.GetMessageRequest{MessageId: id})
+		cancel()
+
+		if err == nil && resp.Found {
+			return resp.MessageContent, nil
+		}
+	}
+	return "", fmt.Errorf("mesaj kayitli üyelerden cekilemedi (hepsi kapali olabilir)")
+}
+
+func (n *Node) GetMessage(ctx context.Context, req *pb.GetMessageRequest) (*pb.GetMessageResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	content, exists := n.storage[req.GetMessageId()]
+	if !exists {
+		filePath := fmt.Sprintf("%s/%s.txt", n.diskPath, req.GetMessageId())
+		data, err := os.ReadFile(filePath)
+		if err == nil {
+			content = string(data)
+			n.storage[req.GetMessageId()] = content
+			exists = true
+		}
+	}
+
+	if !exists {
+		return &pb.GetMessageResponse{Found: false}, nil
+	}
+	return &pb.GetMessageResponse{Found: true, MessageContent: content}, nil
+}
 
 func startTCPServer(n *Node) {
 	tcpLis, _ := net.Listen("tcp", ":6666")
@@ -219,6 +239,13 @@ func startTCPServer(n *Node) {
 				if cmd[0] == "SET" && len(cmd) >= 3 {
 					res := n.handleLeaderSet(cmd[1], strings.Join(cmd[2:], " "))
 					c.Write([]byte(res + "\n"))
+				} else if cmd[0] == "GET" {
+					content, err := n.handleLeaderGet(cmd[1])
+					if err != nil {
+						c.Write([]byte("ERROR: " + err.Error() + "\n"))
+					} else {
+						c.Write([]byte("OK " + content + "\n"))
+					}
 				}
 			}
 		}(conn)
@@ -251,7 +278,6 @@ func main() {
 		messageLocation: make(map[string][]string),
 		tolerance:       readTolerance(),
 	}
-	
 	os.MkdirAll(node.diskPath, 0755)
 
 	s := grpc.NewServer()
@@ -269,5 +295,4 @@ func main() {
 		}
 		select {}
 	}
-}
 }
