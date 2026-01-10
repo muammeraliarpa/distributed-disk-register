@@ -41,7 +41,7 @@ type Node struct {
 	messageLocation map[string][]string
 }
 
-// ---   KONFİGÜRASYON   ---
+// --- YARDIMCI FONKSİYONLAR ---
 
 func readTolerance() int {
 	data, err := os.ReadFile("tolerance.conf")
@@ -51,6 +51,8 @@ func readTolerance() int {
 	t, _ := strconv.Atoi(strings.TrimSpace(string(data)))
 	return t
 }
+
+// --- gRPC SERVİS METOTLARI ---
 
 func (n *Node) RegisterMember(ctx context.Context, req *pb.RegistrationRequest) (*pb.RegistrationResponse, error) {
 	addr := req.GetAddress()
@@ -100,10 +102,15 @@ func (n *Node) syncAllMembers() {
 func (n *Node) SyncMembership(ctx context.Context, req *pb.MembershipList) (*pb.Empty, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	for addr := range n.familyMembers { delete(n.familyMembers, addr) }
+
+	for addr := range n.familyMembers {
+		delete(n.familyMembers, addr)
+	}
 
 	for _, info := range req.Members {
-		if info.Address == n.address { continue }
+		if info.Address == n.address {
+			continue
+		}
 		conn, err := grpc.Dial(info.Address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err == nil {
 			n.familyMembers[info.Address] = &NodeMember{
@@ -117,53 +124,14 @@ func (n *Node) SyncMembership(ctx context.Context, req *pb.MembershipList) (*pb.
 	return &pb.Empty{}, nil
 }
 
-func (n *Node) handleLeaderSet(messageID, content string) string {
-	n.mu.Lock()
-	var members []*NodeMember
-	for _, m := range n.familyMembers { members = append(members, m) }
-	n.mu.Unlock()
-
-	if len(members) < n.tolerance { return "ERROR: Yetersiz üye" }
-
-	sort.Slice(members, func(i, j int) bool {
-		return members[i].CurrentMessageCount < members[j].CurrentMessageCount
-	})
-
-	targetMembers := members[:n.tolerance]
-	actualSuccessCount := 0
-	var successfullyWrittenMembers []*NodeMember
-
-	for _, m := range targetMembers {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
-		resp, err := m.Client.ReplicateMessage(ctx, &pb.ReplicateRequest{
-			MessageId: messageID, MessageContent: content,
-		})
-		cancel()
-		if err == nil && resp.Success {
-			actualSuccessCount++
-			successfullyWrittenMembers = append(successfullyWrittenMembers, m)
-		}
-	}
-
-	if actualSuccessCount < n.tolerance { return "ERROR: Yazma başarısız, tolerans sağlanamadı" }
-
-	n.mu.Lock()
-	for _, m := range successfullyWrittenMembers {
-		n.messageLocation[messageID] = append(n.messageLocation[messageID], m.Address)
-		m.CurrentMessageCount++
-	}
-	n.mu.Unlock()
-	n.syncAllMembers()
-	return "OK"
-}
-
 func (n *Node) ReplicateMessage(ctx context.Context, req *pb.ReplicateRequest) (*pb.ReplicateResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	id := req.GetMessageId()
 	content := req.GetMessageContent()
-	
+
+	// Dosyaya yazma işlemleri
 	filePath := fmt.Sprintf("%s/%s.txt", n.diskPath, id)
 	file, _ := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	writer := bufio.NewWriter(file)
@@ -172,35 +140,9 @@ func (n *Node) ReplicateMessage(ctx context.Context, req *pb.ReplicateRequest) (
 	file.Close()
 
 	n.storage[id] = content
+
+
 	return &pb.ReplicateResponse{Success: true}, nil
-}
-
-
-func (n *Node) handleLeaderGet(id string) (string, error) {
-	n.mu.Lock()
-	locations := n.messageLocation[id]
-	n.mu.Unlock()
-
-	if len(locations) == 0 {
-		return "", fmt.Errorf("mesaj sistemde bulunamadi")
-	}
-
-	for _, addr := range locations {
-		n.mu.Lock()
-		m, exists := n.familyMembers[addr]
-		n.mu.Unlock()
-		
-		if !exists { continue }
-
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		resp, err := m.Client.GetMessage(ctx, &pb.GetMessageRequest{MessageId: id})
-		cancel()
-
-		if err == nil && resp.Found {
-			return resp.MessageContent, nil
-		}
-	}
-	return "", fmt.Errorf("mesaj kayitli üyelerden cekilemedi (hepsi kapali olabilir)")
 }
 
 func (n *Node) GetMessage(ctx context.Context, req *pb.GetMessageRequest) (*pb.GetMessageResponse, error) {
@@ -209,19 +151,173 @@ func (n *Node) GetMessage(ctx context.Context, req *pb.GetMessageRequest) (*pb.G
 
 	content, exists := n.storage[req.GetMessageId()]
 	if !exists {
-		filePath := fmt.Sprintf("%s/%s.txt", n.diskPath, req.GetMessageId())
-		data, err := os.ReadFile(filePath)
-		if err == nil {
-			content = string(data)
-			n.storage[req.GetMessageId()] = content
-			exists = true
-		}
-	}
-
-	if !exists {
 		return &pb.GetMessageResponse{Found: false}, nil
 	}
 	return &pb.GetMessageResponse{Found: true, MessageContent: content}, nil
+}
+
+func (n *Node) GetStorageReport(ctx context.Context, req *pb.Empty) (*pb.StorageReportResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return &pb.StorageReportResponse{MessageCount: int32(len(n.storage))}, nil
+}
+
+// --- RAPORLAMA FONKSİYONU ---
+
+func (n *Node) startPeriodicReporting() {
+	ticker := time.NewTicker(3 * time.Second)
+	go func() {
+		for range ticker.C {
+			n.mu.Lock()
+			if n.isLeader {
+				fmt.Println("\n--- 👑 LİDER ANLIK DURUM RAPORU ---")
+				for addr, m := range n.familyMembers {
+					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+					_, err := m.Client.GetStorageReport(ctx, &pb.Empty{})
+					cancel()
+					if err != nil {
+						log.Printf("\n🔴 [SİSTEM] ÜYE ÖLDÜ: %s siliniyor!", addr)
+						delete(n.familyMembers, addr)
+						go n.syncAllMembers()
+						continue
+					}
+				}
+				fmt.Printf("Toplam Benzersiz Mesaj: %d\n", len(n.messageLocation))
+				fmt.Println("Kümedeki Aktif Düğümler:")
+				fmt.Printf("  ⭐ %-20s (BEN/LİDER)\n", n.address)
+				for addr, m := range n.familyMembers {
+					fmt.Printf("  📍 Üye: %-20s | 📁 Mesaj: %d\n", addr, m.CurrentMessageCount)
+				}
+			} else {
+				fmt.Printf("\n--- 👤 ÜYE DURUM RAPORU [%s] ---\n", n.address)
+				fmt.Printf("Yerel Depolama: %d mesaj\n", len(n.storage))
+				fmt.Println("Küme Görünümü:")
+				fmt.Println("  👑 localhost:5555 (LİDER)")
+				fmt.Printf("  📍 %-20s (BEN) | 📁 Saklanan: %d\n", n.address, len(n.storage))
+				for addr, m := range n.familyMembers {
+					if addr == "localhost:5555" || addr == n.address { continue }
+					fmt.Printf("  📍 %-20s       | 📁 Mesaj: %d\n", addr, m.CurrentMessageCount)
+				}
+			}
+			n.mu.Unlock()
+		}
+	}()
+}
+
+// --- LİDER MANTIĞI VE TCP ---
+
+func (n *Node) handleLeaderSet(messageID, content string) string {
+	n.mu.Lock()
+	var members []*NodeMember
+	for _, m := range n.familyMembers {
+		members = append(members, m)
+	}
+	n.mu.Unlock()
+
+	if len(members) < n.tolerance {
+		return "ERROR: Yetersiz üye"
+	}
+
+	// Yükü dengelemek için sıralaama
+	sort.Slice(members, func(i, j int) bool {
+		return members[i].CurrentMessageCount < members[j].CurrentMessageCount
+	})
+
+	// Bu turda yazma işlemi yapılacak üyeleri seçelim
+	targetMembers := members[:n.tolerance]
+	actualSuccessCount := 0
+	var successfullyWrittenMembers []*NodeMember
+
+	for _, m := range targetMembers {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+		resp, err := m.Client.ReplicateMessage(ctx, &pb.ReplicateRequest{
+			MessageId:      messageID,
+			MessageContent: content,
+		})
+		cancel()
+
+		if err == nil && resp.Success {
+			actualSuccessCount++
+			successfullyWrittenMembers = append(successfullyWrittenMembers, m)
+		}
+	}
+
+	// atomik yazma..
+	if actualSuccessCount < n.tolerance {
+		return "ERROR: Yazma başarısız, tolerans sağlanamadı"
+	}
+
+	n.mu.Lock()
+	for _, m := range successfullyWrittenMembers {
+		alreadyHasIt := false
+		if owners, ok := n.messageLocation[messageID]; ok {
+			for _, addr := range owners {
+				if addr == m.Address {
+					alreadyHasIt = true
+					break
+				}
+			}
+		}
+
+		if !alreadyHasIt {
+			m.CurrentMessageCount++
+			n.messageLocation[messageID] = append(n.messageLocation[messageID], m.Address)
+		}
+	}
+	n.mu.Unlock()
+
+	n.syncAllMembers()
+	return "OK"
+}
+
+func main() {
+	basePort := 5555
+	var lis net.Listener
+	var currentPort int
+
+	for p := basePort; p < 5600; p++ {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err == nil {
+			lis = l
+			currentPort = p
+			break
+		}
+	}
+	
+	subDir := fmt.Sprintf("Data_%d", currentPort)
+	fullPath := fmt.Sprintf("Data/%s", subDir)
+	
+	node := &Node{
+		address:         fmt.Sprintf("localhost:%d", currentPort),
+		storage:         make(map[string]string),
+		diskPath:        fullPath,
+		isLeader:        currentPort == basePort,
+		familyMembers:   make(map[string]*NodeMember),
+		messageLocation: make(map[string][]string),
+		tolerance:       readTolerance(),
+	}
+	err := os.MkdirAll(node.diskPath, 0755)
+	if err != nil {
+		log.Fatalf("Klasör oluşturulamadı: %v", err)
+	}
+
+	s := grpc.NewServer()
+	pb.RegisterReplicationServiceServer(s, node)
+	pb.RegisterRegistrationServiceServer(s, node)
+	go s.Serve(lis)
+
+	node.startPeriodicReporting()
+
+	if node.isLeader {
+		startTCPServer(node)
+	} else {
+		conn, err := grpc.Dial("localhost:5555", grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			client := pb.NewRegistrationServiceClient(conn)
+			client.RegisterMember(context.Background(), &pb.RegistrationRequest{Address: node.address})
+		}
+		select {}
+	}
 }
 
 func startTCPServer(n *Node) {
@@ -252,47 +348,31 @@ func startTCPServer(n *Node) {
 	}
 }
 
-func main() {
-	basePort := 5555
-	var lis net.Listener
-	var currentPort int
+// liderin üyelerden veri çekme mantığı
+func (n *Node) handleLeaderGet(id string) (string, error) {
+	n.mu.Lock()
+	locations := n.messageLocation[id]
+	n.mu.Unlock()
 
-	for p := basePort; p < 5600; p++ {
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
-		if err == nil {
-			lis = l
-			currentPort = p
-			break
+	if len(locations) == 0 {
+		return "", fmt.Errorf("mesaj sistemde bulunamadi")
+	}
+
+	// Mesajın olduğu bilinen üyeleri sırayla denediğ yer
+	for _, addr := range locations {
+		n.mu.Lock()
+		m, exists := n.familyMembers[addr]
+		n.mu.Unlock()
+		
+		if !exists { continue }
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		resp, err := m.Client.GetMessage(ctx, &pb.GetMessageRequest{MessageId: id})
+		cancel()
+
+		if err == nil && resp.Found {
+			return resp.MessageContent, nil
 		}
 	}
-
-	subDir := fmt.Sprintf("Data_%d", currentPort)
-	fullPath := fmt.Sprintf("Data/%s", subDir)
-
-	node := &Node{
-		address:         fmt.Sprintf("localhost:%d", currentPort),
-		storage:         make(map[string]string),
-		diskPath:        fullPath,
-		isLeader:        currentPort == basePort,
-		familyMembers:   make(map[string]*NodeMember),
-		messageLocation: make(map[string][]string),
-		tolerance:       readTolerance(),
-	}
-	os.MkdirAll(node.diskPath, 0755)
-
-	s := grpc.NewServer()
-	pb.RegisterReplicationServiceServer(s, node)
-	pb.RegisterRegistrationServiceServer(s, node)
-	go s.Serve(lis)
-
-	if node.isLeader {
-		startTCPServer(node)
-	} else {
-		conn, err := grpc.Dial("localhost:5555", grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err == nil {
-			client := pb.NewRegistrationServiceClient(conn)
-			client.RegisterMember(context.Background(), &pb.RegistrationRequest{Address: node.address})
-		}
-		select {}
-	}
+	return "", fmt.Errorf("mesaj kayitli üyelerden cekilemedi (üyeler kapali olabilir)")
 }
