@@ -208,23 +208,56 @@ func (n *Node) startPeriodicReporting() {
 
 func (n *Node) handleLeaderSet(messageID, content string) string {
 	n.mu.Lock()
-	var members []*NodeMember
+	
+	existingOwners, exists := n.messageLocation[messageID]
+	
+	var targetMembers []*NodeMember
+	
+	var allMembers []*NodeMember
 	for _, m := range n.familyMembers {
-		members = append(members, m)
+		allMembers = append(allMembers, m)
+	}
+	
+	if exists && len(existingOwners) > 0 {
+		for _, addr := range existingOwners {
+			if m, ok := n.familyMembers[addr]; ok {
+				targetMembers = append(targetMembers, m)
+			}
+		}
+		if len(targetMembers) < n.tolerance {
+			sort.Slice(allMembers, func(i, j int) bool {
+				return allMembers[i].CurrentMessageCount < allMembers[j].CurrentMessageCount
+			})
+			
+			for _, m := range allMembers {
+				alreadyInList := false
+				for _, t := range targetMembers {
+					if t.Address == m.Address { alreadyInList = true; break }
+				}
+				
+				if !alreadyInList {
+					targetMembers = append(targetMembers, m)
+					if len(targetMembers) == n.tolerance { break }
+				}
+			}
+		}
+	} else {
+		sort.Slice(allMembers, func(i, j int) bool {
+			return allMembers[i].CurrentMessageCount < allMembers[j].CurrentMessageCount
+		})
+		
+		if len(allMembers) >= n.tolerance {
+			targetMembers = allMembers[:n.tolerance]
+		} else {
+			targetMembers = allMembers
+		}
 	}
 	n.mu.Unlock()
 
-	if len(members) < n.tolerance {
+	if len(targetMembers) < n.tolerance {
 		return "ERROR: Yetersiz üye"
 	}
 
-	// Yükü dengelemek için sıralaama
-	sort.Slice(members, func(i, j int) bool {
-		return members[i].CurrentMessageCount < members[j].CurrentMessageCount
-	})
-
-	// Bu turda yazma işlemi yapılacak üyeleri seçelim
-	targetMembers := members[:n.tolerance]
 	actualSuccessCount := 0
 	var successfullyWrittenMembers []*NodeMember
 
@@ -242,28 +275,27 @@ func (n *Node) handleLeaderSet(messageID, content string) string {
 		}
 	}
 
-	// atomik yazma..
 	if actualSuccessCount < n.tolerance {
 		return "ERROR: Yazma başarısız, tolerans sağlanamadı"
 	}
 
 	n.mu.Lock()
+	var newOwnerList []string
 	for _, m := range successfullyWrittenMembers {
-		alreadyHasIt := false
-		if owners, ok := n.messageLocation[messageID]; ok {
-			for _, addr := range owners {
-				if addr == m.Address {
-					alreadyHasIt = true
-					break
-				}
+		newOwnerList = append(newOwnerList, m.Address)
+		
+		isUpdate := false
+		if exists {
+			for _, oldAddr := range existingOwners {
+				if oldAddr == m.Address { isUpdate = true; break }
 			}
 		}
-
-		if !alreadyHasIt {
+		
+		if !isUpdate {
 			m.CurrentMessageCount++
-			n.messageLocation[messageID] = append(n.messageLocation[messageID], m.Address)
 		}
 	}
+	n.messageLocation[messageID] = newOwnerList
 	n.mu.Unlock()
 
 	n.syncAllMembers()
@@ -348,7 +380,7 @@ func startTCPServer(n *Node) {
 	}
 }
 
-// liderin üyelerden veri çekme mantığı
+// Liderin üyelerden veri çekme mantığı
 func (n *Node) handleLeaderGet(id string) (string, error) {
 	n.mu.Lock()
 	locations := n.messageLocation[id]
