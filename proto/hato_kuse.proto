@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package hatokuse;
+
+option go_package = "./proto";
+
+service RegistrationService {
+  rpc RegisterMember (RegistrationRequest) returns (RegistrationResponse);
+  
+
+  rpc SyncMembership (MembershipList) returns (Empty);
+}
+
+message RegistrationRequest {
+  string address = 1; 
+}
+
+message RegistrationResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message MembershipList {
+  message MemberInfo {
+    string address = 1;
+    int32 count = 2;
+  }
+  repeated MemberInfo members = 1; 
+}
+
+
+service ReplicationService {
+  rpc ReplicateMessage (ReplicateRequest) returns (ReplicateResponse);
+  rpc GetMessage (GetMessageRequest) returns (GetMessageResponse); 
+  rpc GetStorageReport (Empty) returns (StorageReportResponse); 
+}
+
+message ReplicateRequest {
+  string message_id = 1; 
+  string message_content = 2; 
+}
+
+message ReplicateResponse {
+  bool success = 1;
+  string error_message = 2; 
+}
+
+message GetMessageRequest {
+  string message_id = 1;
+}
+
+message GetMessageResponse {
+  bool found = 1;
+  string message_content = 2;
+  string error_message = 3;
+}
+
+message StorageReportResponse {
+    int32 message_count = 1;
+}
+
+message Empty {}
