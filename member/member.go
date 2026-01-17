@@ -132,10 +132,6 @@ func (n *Node) ReplicateMessage(ctx context.Context, req *pb.ReplicateRequest) (
 	content := req.GetMessageContent()
 	filePath := fmt.Sprintf("%s/%s.txt", n.diskPath, id)
 
-	fileUnbuf, _ := os.OpenFile(filePath+"_direct", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	fileUnbuf.Write([]byte(content))
-	fileUnbuf.Close()
-
 	fileBuf, _ := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	writer := bufio.NewWriter(fileBuf)
 	writer.WriteString(content)
